@@ -76,7 +76,9 @@ def crop_with_margin(img,x,y,w,h,margin=0.2):
     H,W=img.shape[:2]; mx=int(w*margin); my=int(h*margin)
     x0=max(0,x-mx); y0=max(0,y-my); x1=min(W,x+w+mx); y1=min(H,y+h+my); return img[y0:y1,x0:x1]
 def encode_jpeg(img,q=80):
-    ok,buf=cv2.imencode(".jpg",img,[int(cv2.IMWRITE_JPEG_QUALITY),q]); return buf.tobytes() if ok else b""
+    # Don't convert! OpenCV imencode handles RGB correctly on this system
+    ok,buf=cv2.imencode(".jpg",img,[int(cv2.IMWRITE_JPEG_QUALITY),q])
+    return buf.tobytes() if ok else b""
 def faces_grid(crops:List[np.ndarray],cols=3,cell=200,bg=(30,30,30)):
     if not crops: return np.zeros((cell,cell,3),dtype=np.uint8)
     import math
@@ -94,13 +96,15 @@ def make_backend_message(camera_id:str,jpeg_bytes:bytes)->bytes:
 def camera_loop():
     global STOP
     picam2=Picamera2()
+    # Use RGB888 - this is what works correctly
     cfg=picam2.create_video_configuration(main={"size":(CAM_WIDTH,CAM_HEIGHT),"format":"RGB888"})
     picam2.configure(cfg); picam2.start()
+    print("Using RGB888 format (raw, no conversion in camera_loop)")
+    
     try:
         while not STOP:
-            frame=picam2.capture_array()  # RGB
-            bgr=cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            with LOCK: FRAME_BUFFER.append(bgr)
+            frame=picam2.capture_array()  # RGB format
+            with LOCK: FRAME_BUFFER.append(frame)
             time.sleep(0.005)
     finally:
         picam2.stop()
@@ -114,7 +118,7 @@ def detection_and_publish_loop():
         now=time.time()
         if (now-last)>=interval:
             last=now
-            small=cv2.resize(frame,(0,0),fx=0.5,fy=0.5); gray=cv2.cvtColor(small,cv2.COLOR_BGR2GRAY)
+            small=cv2.resize(frame,(0,0),fx=0.5,fy=0.5); gray=cv2.cvtColor(small,cv2.COLOR_RGB2GRAY)
             faces=CASCADE.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(60,60))
             crops=[]
             for (x,y,w,h) in faces:

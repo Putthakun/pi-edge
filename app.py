@@ -86,11 +86,6 @@ STOP = False
 mq_outbox: "queue.Queue[bytes]" = queue.Queue(maxsize=200)
 
 # ----------------- CV Utils -----------------
-CASCADE_PATH = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
-CASCADE = cv2.CascadeClassifier(CASCADE_PATH)
-if CASCADE.empty():
-    raise RuntimeError(f"Failed to load Haar cascade: {CASCADE_PATH}")
-
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -128,20 +123,20 @@ def camera_loop():
     finally:
         picam2.stop()
 
+print("🔍 Checking model output shape...")
+for i, out in enumerate(session.get_outputs()):
+    print(f"Output {i}: name={out.name}, shape={out.shape}")
+
 def detect_loop():
-    """
-    YOLOv8-face ONNX detect loop (fixed decode + NMS)
-    ????????????????? output absolute pixel coordinate (????? NMS ???????)
-    """
-    global _preview_jpeg, _save_counter
+    global _preview_jpeg
     interval = max(40, DETECT_INTERVAL_MS) / 1000.0
     last = 0.0
-    conf_thresh = 0.45
+    conf_thresh = 0.4
+    iou_thresh = 0.45
 
-    print("[INFO] YOLOv8-face detect_loop started ?")
+    print("[INFO] YOLO-face decode (direct pixel output) started ✅")
 
     def nms(boxes, scores, iou_threshold=0.45):
-        """Perform Non-Maximum Suppression."""
         if len(boxes) == 0:
             return []
         boxes = np.array(boxes)
@@ -164,6 +159,7 @@ def detect_loop():
             inds = np.where(ovr <= iou_threshold)[0]
             order = order[inds + 1]
         return keep
+
     while not STOP:
         with _state_lock:
             frame = FRAME_BUFFER[-1].copy() if FRAME_BUFFER else None
@@ -172,93 +168,49 @@ def detect_loop():
             continue
 
         now = time.time()
-        if (now - last) >= interval:
-            last = now
-            frame_draw = frame.copy()
+        if (now - last) < interval:
+            time.sleep(0.002)
+            continue
+        last = now
 
-            # --- Prepare input ---
-            img = cv2.resize(frame, (640, 640))
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            tensor = np.transpose(img_rgb, (2, 0, 1))[np.newaxis, :, :, :].astype(np.float32) / 255.0
+        H, W = frame.shape[:2]
+        img = cv2.resize(frame, (640, 640))
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        tensor = np.expand_dims(np.transpose(img_rgb, (2, 0, 1)), 0).astype(np.float32) / 255.0
 
-            # --- Inference ---
-            outputs = session.run(None, {"images": tensor})
-            pred = outputs[0].squeeze(0)
+        pred = session.run(None, {"images": tensor})[0]  # (1,20,8400)
+        pred = pred.squeeze(0).T  # (8400,20)
 
-            # --- Fix shape ---
-            if pred.shape[0] > pred.shape[1]:
-                pred = pred.T
-                print("[DEBUG] Transposed prediction to (20, 8400)")
+        # ใช้ค่า x,y,w,h และ conf โดยตรง
+        x, y, w, h, conf = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3], pred[:, 4]
+        mask = conf > conf_thresh
+        x, y, w, h, conf = x[mask], y[mask], w[mask], h[mask], conf[mask]
 
-            # --- Sigmoid ---
-            pred[4:, :] = 1 / (1 + np.exp(-pred[4:, :]))
+        boxes, scores = [], []
+        for i in range(len(x)):
+            x1 = int((x[i] - w[i] / 2) * W / 640)
+            y1 = int((y[i] - h[i] / 2) * H / 640)
+            x2 = int((x[i] + w[i] / 2) * W / 640)
+            y2 = int((y[i] + h[i] / 2) * H / 640)
 
-            # --- Confidence channel 4 ---
-            conf = 1 / (1 + np.exp(-pred[4, :]))
-            # --- Decode boxes (absolute pixel) ---
-            xywh = pred[:4, :].T
-            boxes = np.zeros_like(xywh)
-            boxes[:, 0] = xywh[:, 0] - xywh[:, 2] / 2  # x1
-            boxes[:, 1] = xywh[:, 1] - xywh[:, 3] / 2  # y1
-            boxes[:, 2] = xywh[:, 0] + xywh[:, 2] / 2  # x2
-            boxes[:, 3] = xywh[:, 1] + xywh[:, 3] / 2  # y2
-            boxes = np.clip(boxes, 0, 640)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            boxes.append((x1, y1, x2, y2))
+            scores.append(float(conf[i]))
 
-            # --- Scale back to real frame ---
-            H, W = frame.shape[:2]
-            scale_x = W / 640
-            scale_y = H / 640
-            boxes[:, [0, 2]] *= scale_x
-            boxes[:, [1, 3]] *= scale_y
+        keep = nms(boxes, scores, iou_threshold=iou_thresh)
+        frame_draw = frame.copy()
 
-            # --- Filter by confidence ---
-            mask = conf > conf_thresh
-            boxes = boxes[mask]
-            conf = conf[mask]
+        if len(keep) > 0:
+            print(f"[INFO] ✅ Detected {len(keep)} faces")
+            for i in keep:
+                x1, y1, x2, y2 = map(int, boxes[i])
+                cv2.rectangle(frame_draw, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        else:
+            print("[INFO] ❌ No face detected")
 
-            # --- Apply NMS ---
-            keep = nms(boxes, conf, iou_threshold=0.45)
-            boxes = boxes[keep]
-            conf = conf[keep]
-
-            print(f"[INFO] ? NMS reduced to {len(boxes)} boxes")
-            # --- Draw boxes ---
-            detections = 0
-            for i, (x1, y1, x2, y2) in enumerate(boxes):
-                c = conf[i]
-                if (x2 - x1) < 10 or (y2 - y1) < 10:
-                    continue
-
-                detections += 1
-                cv2.rectangle(frame_draw, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                if detections <= 3:
-                    print(f"det {detections}: conf={c:.3f}, box=({int(x1)},{int(y1)},{int(x2)},{int(y2)})")
-
-                face = crop_with_margin(frame, int(x1), int(y1), int(x2 - x1), int(y2 - y1), FACE_MARGIN_RATIO)
-                if face is None or face.size == 0:
-                    continue
-
-                jpg = encode_jpeg(face, JPEG_QUALITY)
-                if len(jpg) > MAX_IMAGE_BYTES:
-                    jpg = encode_jpeg(face, max(50, JPEG_QUALITY - 20))
-                    if len(jpg) > MAX_IMAGE_BYTES:
-                        continue
-
-                payload = make_backend_message(DEVICE_ID, jpg)
-                try:
-                    mq_outbox.put_nowait(payload)
-                except queue.Full:
-                    pass
-
-            if detections > 0:
-                print(f"[INFO] ? Detected {detections} faces")
-            else:
-                print("[INFO] ? No face detected")
-
-            with _state_lock:
-                _preview_jpeg = encode_jpeg(frame_draw, JPEG_QUALITY)
-
-        time.sleep(0.002)
+        with _state_lock:
+            _preview_jpeg = encode_jpeg(frame_draw, JPEG_QUALITY)
 
 
 

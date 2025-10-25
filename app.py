@@ -4,26 +4,28 @@ from datetime import datetime, timezone
 from collections import deque
 from typing import Optional, List
 
+import onnxruntime as ort
 import numpy as np
 import cv2
 import pika
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect 
 from fastapi.responses import StreamingResponse
+import asyncio  
 from dotenv import load_dotenv
 from pathlib import Path
 from picamera2 import Picamera2
 
-# load_dotenv(override=True)---------------- Config ----------------
+# ---------------- Config ----------------
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
-SAVE_DIR = os.getenv("SAVE_DIR", "/tmp/pi_face_crops")     # ??????????????? debug
-SAVE_EVERY_N = int(os.getenv("SAVE_EVERY_N", "1"))         # ?????? N ?????? (1 = ?????????)
+SAVE_DIR = os.getenv("SAVE_DIR", "/tmp/pi_face_crops")
+SAVE_EVERY_N = int(os.getenv("SAVE_EVERY_N", "1"))
 os.makedirs(SAVE_DIR, exist_ok=True)
 _save_counter = 0
 
 CAM_WIDTH  = int(os.getenv("CAM_WIDTH", "1280"))
 CAM_HEIGHT = int(os.getenv("CAM_HEIGHT", "720"))
-DETECT_INTERVAL_MS = int(os.getenv("DETECT_INTERVAL_MS", "80"))  # ????? 80ms ???????
+DETECT_INTERVAL_MS = int(os.getenv("DETECT_INTERVAL_MS", "80"))
 FACE_MARGIN_RATIO  = float(os.getenv("FACE_MARGIN_RATIO", "0.20"))
 JPEG_QUALITY       = int(os.getenv("JPEG_QUALITY", "80"))
 MAX_IMAGE_BYTES    = int(os.getenv("MAX_IMAGE_BYTES", str(512*1024)))
@@ -36,6 +38,9 @@ QUEUE_NAME  = os.getenv("QUEUE", "face_images")
 
 HTTP_HOST   = os.getenv("HTTP_HOST", "0.0.0.0")
 HTTP_PORT   = int(os.getenv("HTTP_PORT", "8000"))
+
+session = ort.InferenceSession("face_final.onnx", providers=["CPUExecutionProvider"])
+
 if not AMQP_URL:
     raise RuntimeError("AMQP_URL missing")
 
@@ -54,7 +59,6 @@ class MQPublisher:
             if self._queue: self._ch.queue_bind(queue=self._queue, exchange=self._exchange, routing_key=self._routing_key)
 
     def publish(self, body: bytes, content_type: str="application/json"):
-        # ?? retry ??? block ??????????? (???????? detect/stream)
         backoff=1.0
         while True:
             try:
@@ -75,14 +79,12 @@ publisher = MQPublisher(AMQP_URL, EXCHANGE, ROUTING_KEY, QUEUE_NAME)
 # ------------- App & Shared State -------------
 app = FastAPI(title="Pi5 Face Stream + Face Publisher")
 
-FRAME_BUFFER = deque(maxlen=3)     # ???????????????
-_preview_jpeg = b""                # ?????? JPEG ?????? (???????? /stream)
-_state_lock  = threading.Lock()    # ???????? ? ???????? reference
-
+FRAME_BUFFER = deque(maxlen=3)
+_preview_jpeg = b""
+_state_lock  = threading.Lock()
 STOP = False
-
-# ????????? "?????? MQ" ??????? (???????? detect)
 mq_outbox: "queue.Queue[bytes]" = queue.Queue(maxsize=200)
+
 # ----------------- CV Utils -----------------
 CASCADE_PATH = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
 CASCADE = cv2.CascadeClassifier(CASCADE_PATH)
@@ -112,31 +114,57 @@ def make_backend_message(camera_id: str, jpeg_bytes: bytes) -> bytes:
 def camera_loop():
     global STOP
     picam2 = Picamera2()
-    cfg = picam2.create_video_configuration(
-        main={"size": (CAM_WIDTH, CAM_HEIGHT), "format": "RGB888"}
-    )
+    cfg = picam2.create_video_configuration(main={"size": (CAM_WIDTH, CAM_HEIGHT), "format": "RGB888"})
     picam2.configure(cfg)
     picam2.start()
     print("[camera] RGB888 started")
 
     try:
         while not STOP:
-            frame = picam2.capture_array()  # RGB ndarray
-            # ?????????????? (??????? race ???? lock)
+            frame = picam2.capture_array()
             with _state_lock:
                 FRAME_BUFFER.append(frame)
             time.sleep(0.005)
     finally:
         picam2.stop()
 
-
 def detect_loop():
+    """
+    YOLOv8-face ONNX detect loop (fixed decode + NMS)
+    ????????????????? output absolute pixel coordinate (????? NMS ???????)
+    """
     global _preview_jpeg, _save_counter
     interval = max(40, DETECT_INTERVAL_MS) / 1000.0
     last = 0.0
+    conf_thresh = 0.45
 
+    print("[INFO] YOLOv8-face detect_loop started ?")
+
+    def nms(boxes, scores, iou_threshold=0.45):
+        """Perform Non-Maximum Suppression."""
+        if len(boxes) == 0:
+            return []
+        boxes = np.array(boxes)
+        scores = np.array(scores)
+        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+        order = scores.argsort()[::-1]
+        keep = []
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            w = np.maximum(0.0, xx2 - xx1 + 1)
+            h = np.maximum(0.0, yy2 - yy1 + 1)
+            inter = w * h
+            ovr = inter / (areas[i] + areas[order[1:]] - inter)
+            inds = np.where(ovr <= iou_threshold)[0]
+            order = order[inds + 1]
+        return keep
     while not STOP:
-        # ?????????????
         with _state_lock:
             frame = FRAME_BUFFER[-1].copy() if FRAME_BUFFER else None
         if frame is None:
@@ -146,67 +174,95 @@ def detect_loop():
         now = time.time()
         if (now - last) >= interval:
             last = now
+            frame_draw = frame.copy()
 
-            # ???????: ??? (??? MQ) ???????????????? (???? /stream)
-            frame_raw  = frame                      # ??? ? ???????/??? MQ
-            frame_draw = frame.copy()               # ????????????????????????
+            # --- Prepare input ---
+            img = cv2.resize(frame, (640, 640))
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            tensor = np.transpose(img_rgb, (2, 0, 1))[np.newaxis, :, :, :].astype(np.float32) / 255.0
 
-            # ???????? + ??? ????? detect ????????
-            small = cv2.resize(frame_raw, (0, 0), fx=0.5, fy=0.5)
-            gray  = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+            # --- Inference ---
+            outputs = session.run(None, {"images": tensor})
+            pred = outputs[0].squeeze(0)
 
-            # ?????????????
-            faces = CASCADE.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(60, 60))
+            # --- Fix shape ---
+            if pred.shape[0] > pred.shape[1]:
+                pred = pred.T
+                print("[DEBUG] Transposed prediction to (20, 8400)")
 
-            for (x, y, w, h) in faces:
-                # scale ??????????????????
-                X, Y, W, H = int(x * 2), int(y * 2), int(w * 2), int(h * 2)
+            # --- Sigmoid ---
+            pred[4:, :] = 1 / (1 + np.exp(-pred[4:, :]))
 
-                # ??????? "?????" ?? frame_draw ?????????????????
-                cv2.rectangle(frame_draw, (X, Y), (X + W, Y + H), (0, 255, 0), 3)
+            # --- Confidence channel 4 ---
+            conf = 1 / (1 + np.exp(-pred[4, :]))
+            # --- Decode boxes (absolute pixel) ---
+            xywh = pred[:4, :].T
+            boxes = np.zeros_like(xywh)
+            boxes[:, 0] = xywh[:, 0] - xywh[:, 2] / 2  # x1
+            boxes[:, 1] = xywh[:, 1] - xywh[:, 3] / 2  # y1
+            boxes[:, 2] = xywh[:, 0] + xywh[:, 2] / 2  # x2
+            boxes[:, 3] = xywh[:, 1] + xywh[:, 3] / 2  # y2
+            boxes = np.clip(boxes, 0, 640)
 
-                # ??????? "???????" (?????????) ??????? MQ
-                face = crop_with_margin(frame_raw, X, Y, W, H, FACE_MARGIN_RATIO)
+            # --- Scale back to real frame ---
+            H, W = frame.shape[:2]
+            scale_x = W / 640
+            scale_y = H / 640
+            boxes[:, [0, 2]] *= scale_x
+            boxes[:, [1, 3]] *= scale_y
+
+            # --- Filter by confidence ---
+            mask = conf > conf_thresh
+            boxes = boxes[mask]
+            conf = conf[mask]
+
+            # --- Apply NMS ---
+            keep = nms(boxes, conf, iou_threshold=0.45)
+            boxes = boxes[keep]
+            conf = conf[keep]
+
+            print(f"[INFO] ? NMS reduced to {len(boxes)} boxes")
+            # --- Draw boxes ---
+            detections = 0
+            for i, (x1, y1, x2, y2) in enumerate(boxes):
+                c = conf[i]
+                if (x2 - x1) < 10 or (y2 - y1) < 10:
+                    continue
+
+                detections += 1
+                cv2.rectangle(frame_draw, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                if detections <= 3:
+                    print(f"det {detections}: conf={c:.3f}, box=({int(x1)},{int(y1)},{int(x2)},{int(y2)})")
+
+                face = crop_with_margin(frame, int(x1), int(y1), int(x2 - x1), int(y2 - y1), FACE_MARGIN_RATIO)
                 if face is None or face.size == 0:
                     continue
 
-                # ???????? JPEG ??????? (????????????? ??????????????)
                 jpg = encode_jpeg(face, JPEG_QUALITY)
                 if len(jpg) > MAX_IMAGE_BYTES:
                     jpg = encode_jpeg(face, max(50, JPEG_QUALITY - 20))
                     if len(jpg) > MAX_IMAGE_BYTES:
                         continue
 
-                # (??????) ???????????????????????? MQ ????????
-                _save_counter += 1
-                if SAVE_EVERY_N > 0 and (_save_counter % SAVE_EVERY_N == 0):
-                    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                    fname = f"{DEVICE_ID}_{ts}_{X}-{Y}-{W}x{H}.jpg"
-                    fpath = os.path.join(SAVE_DIR, fname)
-                    try:
-                        with open(fpath, "wb") as f:
-                            f.write(jpg)  # ??????????????????????????? MQ 100%
-                    except Exception as e:
-                        print("[DEBUG SAVE ERROR]", e)
-
-                # ????????? worker ??????? RabbitMQ (non-blocking)
                 payload = make_backend_message(DEVICE_ID, jpg)
                 try:
                     mq_outbox.put_nowait(payload)
                 except queue.Full:
                     pass
 
-            # ????????????????????? /stream (????????????????????)
-            preview_jpeg = encode_jpeg(frame_draw, JPEG_QUALITY)
+            if detections > 0:
+                print(f"[INFO] ? Detected {detections} faces")
+            else:
+                print("[INFO] ? No face detected")
+
             with _state_lock:
-                _preview_jpeg = preview_jpeg
+                _preview_jpeg = encode_jpeg(frame_draw, JPEG_QUALITY)
 
         time.sleep(0.002)
 
 
 
 def mq_worker_loop():
-    # ??????? MQ ??? ? ??? broker ??????????????????/???????
     while not STOP:
         try:
             payload = mq_outbox.get(timeout=0.5)
@@ -215,7 +271,6 @@ def mq_worker_loop():
         try:
             publisher.publish(payload, content_type="application/json")
         except Exception:
-            # ?????????????? MQ ????? ? ??????????????????
             pass
 
 # --------------- MJPEG streaming ---------------
@@ -224,7 +279,6 @@ def mjpeg_stream(get_jpeg_fn, boundary="frame", fps=15):
     while True:
         start = time.time()
         jpg = get_jpeg_fn()
-        # ????????????????? ????????????????? ?????????????????
         if not jpg:
             black = np.zeros((200,200,3), dtype=np.uint8)
             jpg = encode_jpeg(black, 60)
@@ -235,17 +289,14 @@ def mjpeg_stream(get_jpeg_fn, boundary="frame", fps=15):
                 b"Content-Length: " + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n"
             )
         except Exception:
-            # ???????????/???????? ? ??????????
             break
         elapsed = time.time() - start
         if elapsed < min_interval:
             time.sleep(min_interval - elapsed)
 
 def get_preview_jpeg() -> bytes:
-    # ???? reference ???????????? ??????????????
     with _state_lock:
         data = _preview_jpeg
-        # ??????????? (???????) ?????????????????????????????????
         fallback = FRAME_BUFFER[-1] if FRAME_BUFFER else None
     if data:
         return data
@@ -264,6 +315,31 @@ def stream():
         mjpeg_stream(get_preview_jpeg, fps=15),
         media_type='multipart/x-mixed-replace; boundary=frame'
     )
+
+@app.websocket("/video_feed/{camera_id}")
+async def video_feed(websocket: WebSocket, camera_id: str):
+    await websocket.accept()
+    print(f"[WS] connected: {camera_id}")
+
+    if camera_id != DEVICE_ID:
+        await websocket.send_text("Invalid camera_id")
+        await websocket.close()
+        print(f"[WS] rejected: invalid camera_id {camera_id}")
+        return
+
+    try:
+        while True:
+            jpg = get_preview_jpeg()
+            if not jpg:
+                await asyncio.sleep(0.05)
+                continue
+            frame_base64 = base64.b64encode(jpg).decode("utf-8")
+            await websocket.send_text(frame_base64)
+            await asyncio.sleep(0.05)
+    except WebSocketDisconnect:
+        print(f"[WS] disconnected: {camera_id}")
+    except Exception as e:
+        print(f"[WS] error: {e}")
 
 # -------------- Boot Threads --------------
 def start_background():

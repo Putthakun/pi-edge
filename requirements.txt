@@ -3,7 +3,8 @@ uvicorn[standard]==0.31.1
 pika==1.3.2
 python-dotenv==1.0.1
 onnxruntime==1.20.0
-# numpy, opencv ติดตั้งผ่าน APT แล้ว
+pyudev
+
 
 
 
